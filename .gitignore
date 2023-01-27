@@ -1,0 +1,5 @@
+/target
+pascals-triangle-multi-threaded
+pascals-triangle-single-threaded
+# Ignore any flamecharts:
+*.svg
