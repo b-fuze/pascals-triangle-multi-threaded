@@ -2,7 +2,7 @@ use std::env::args;
 use std::thread;
 use std::sync::Arc;
 use std::fmt::Write;
-use crossbeam::channel::bounded;
+use crossbeam::channel::{bounded, unbounded};
 
 #[derive(Clone)]
 struct Workload {
@@ -20,7 +20,7 @@ struct ThreadOutput {
     output_string: Arc<String>,
 }
 
-const THREAD_BATCH_SIZE: usize = 100;
+const THREAD_BATCH_SIZE: usize = 5000;
 const OUTPUT_BUFFER_MAX_SIZE: usize = 1024 * 1024 * 500; // 500MiB
 
 fn main() {
@@ -87,7 +87,14 @@ fn main() {
         })
         .collect::<Vec<_>>();
 
-    let mut console_output = String::new();
+    let (stdout_channel, stdout_channel_recv) = unbounded();
+    let stdout_thread = thread::spawn(move || {
+        while let Some(console_output) = stdout_channel_recv.recv().unwrap() {
+            print!("{}", console_output);
+        }
+    });
+
+    let mut console_output_size = 0;
     let mut previous_row = vec![0; rows + 1];
     // First two numbers of previous_row are 1, the rest 0
     previous_row[0..2].copy_from_slice(&[1, 1]);
@@ -96,10 +103,11 @@ fn main() {
     let mut write_log = Vec::with_capacity(num_cpus * THREAD_BATCH_SIZE);
     let mut write_log_row_offset = 0;
 
-    write!(&mut console_output, "{:?}\n", [1]).unwrap();
-    write!(&mut console_output, "{:?}\n", [1, 1]).unwrap();
+    println!("{:?}", [1]);
+    println!("{:?}", [1, 1]);
 
     for i in 3..=rows {
+        let mut console_output = String::with_capacity(console_output_size);
         write!(&mut console_output, "[1").unwrap();
         let mut row_offset = 0;
 
@@ -162,11 +170,11 @@ fn main() {
                 }
             }
 
-            // Flush string if it gets too big
-            if console_output.len() > OUTPUT_BUFFER_MAX_SIZE {
-                print!("{}", &console_output);
-                console_output.clear();
-            }
+            // // Flush string if it gets too big
+            // if console_output.len() > OUTPUT_BUFFER_MAX_SIZE {
+            //     print!("{}", &console_output);
+            //     console_output.clear();
+            // }
         }
 
         // Write previous log
@@ -179,17 +187,19 @@ fn main() {
 
         write_log_row_offset = 0;
         write!(&mut console_output, "]\n").unwrap();
-    }
 
-    // Print output
-    print!("{}", &console_output);
+        console_output_size = console_output.len();
+        stdout_channel.send(Some(console_output)).unwrap();
+    }
 
     // Shut down threads
     for index in 0..num_cpus {
         input_channels[index].0.send(None).unwrap();
     }
+    stdout_channel.send(None).unwrap();
 
     for thread in threads {
         thread.join().unwrap();
     }
+    stdout_thread.join().unwrap();
 }
