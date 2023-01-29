@@ -1,6 +1,7 @@
 use std::env::args;
 use std::thread;
 use std::sync::{Arc, RwLock};
+#[cfg(not(feature = "no-output"))]
 use std::fmt::Write;
 use crossbeam::channel::{bounded, unbounded};
 
@@ -18,6 +19,7 @@ struct ThreadReport {
     output_vec: Arc<Vec<u64>>,
 }
 
+#[cfg(not(feature = "no-output"))]
 enum StdoutOutput {
     Start {
         thread_count: usize,
@@ -40,7 +42,9 @@ fn main() {
     let num_cpus = num_cpus::get();
     // let num_cpus = 1; // Uncomment to force "single threaded"
 
+    #[cfg(not(feature = "no-output"))]
     let (stdout_channel, stdout_channel_recv) = unbounded::<StdoutOutput>();
+    #[cfg(not(feature = "no-output"))]
     let stdout_thread = thread::spawn(move || {
         let mut thread_outputs = vec![None; num_cpus];
         let mut thread_count = 0;
@@ -98,6 +102,7 @@ fn main() {
         .into_iter()
         .map(|_| Some(Arc::clone(&previous_row)))
         .collect::<Vec<_>>();
+    #[cfg(not(feature = "no-output"))]
     let mut output_channels = (0..num_cpus)
         .into_iter()
         .map(|_| Some(stdout_channel.clone()))
@@ -116,10 +121,12 @@ fn main() {
         .map(|index| {
             let previous_row = previous_row_refs[index].take().unwrap();
             let sync_output_channel = output_channel.clone();
+            #[cfg(not(feature = "no-output"))]
             let output_channel = output_channels[index].take().unwrap();
             let input_channel = input_channels[index].1.take().unwrap();
             thread::spawn(move || {
                 let mut output = Arc::new(vec![0; THREAD_BATCH_SIZE + 1]);
+                #[cfg(not(feature = "no-output"))]
                 let mut output_string = String::new();
                 while let Some(workload) = input_channel.recv().unwrap() {
                     let mut output_index = 0;
@@ -143,10 +150,14 @@ fn main() {
                             output_index += 1;
                         }
 
-                        output_string.clear();
-                        write!(output_string, "{:?}", &output_vec[0..output_index]).unwrap();
+                        #[cfg(not(feature = "no-output"))]
+                        {
+                            output_string.clear();
+                            write!(output_string, "{:?}", &output_vec[0..output_index]).unwrap();
+                        }
                     }
 
+                    #[cfg(not(feature = "no-output"))]
                     output_channel
                         .send(StdoutOutput::Output {
                             thread_index: index,
@@ -172,8 +183,11 @@ fn main() {
     let mut write_log_row_offset = 0;
     let mut write_log_len = 0;
 
-    println!("{:?}", [1]);
-    println!("{:?}", [1, 1]);
+    #[cfg(not(feature = "no-output"))]
+    {
+        println!("{:?}", [1]);
+        println!("{:?}", [1, 1]);
+    }
 
     for i in 3..=rows {
         let mut row_offset = 0;
@@ -186,7 +200,9 @@ fn main() {
                 thread_count = ((i as i64 - row_offset as i64) / (THREAD_BATCH_SIZE as i64))
                     .max(1)
                     .min(num_cpus as i64) as usize;
+                #[cfg(not(feature = "no-output"))]
                 let has_end = row_offset + THREAD_BATCH_SIZE * num_cpus >= i;
+                #[cfg(not(feature = "no-output"))]
                 stdout_channel.send(StdoutOutput::Start {
                     thread_count,
                     has_begin: row_offset == 0,
@@ -251,10 +267,12 @@ fn main() {
     for index in 0..num_cpus {
         input_channels[index].0.send(None).unwrap();
     }
+    #[cfg(not(feature = "no-output"))]
     stdout_channel.send(StdoutOutput::End).unwrap();
 
     for thread in threads {
         thread.join().unwrap();
     }
+    #[cfg(not(feature = "no-output"))]
     stdout_thread.join().unwrap();
 }
