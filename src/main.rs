@@ -1,27 +1,37 @@
 use std::env::args;
 use std::thread;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::fmt::Write;
 use crossbeam::channel::{bounded, unbounded};
 
 #[derive(Clone)]
 struct Workload {
-    previous_row: Arc<Vec<u64>>,
     offset: usize,
     row_index: usize,
 }
 
 #[derive(Clone)]
-struct ThreadOutput {
+struct ThreadReport {
     thread_index: usize,
     output_size: usize,
     output_start: usize,
     output_vec: Arc<Vec<u64>>,
-    output_string: Arc<String>,
 }
 
-const THREAD_BATCH_SIZE: usize = 5000;
-const OUTPUT_BUFFER_MAX_SIZE: usize = 1024 * 1024 * 500; // 500MiB
+enum StdoutOutput {
+    Start {
+        thread_count: usize,
+        has_begin: bool,
+        has_end: bool,
+    },
+    End,
+    Output {
+        thread_index: usize,
+        output_string: String,
+    },
+}
+
+const THREAD_BATCH_SIZE: usize = 500;
 
 fn main() {
     let rows = args()
@@ -29,7 +39,69 @@ fn main() {
         .parse::<usize>().expect("row count must be a positive integer");
     let num_cpus = num_cpus::get();
     // let num_cpus = 1; // Uncomment to force "single threaded"
-    let (output_channel, output_channel_recv) = bounded::<ThreadOutput>(num_cpus);
+
+    let (stdout_channel, stdout_channel_recv) = unbounded::<StdoutOutput>();
+    let stdout_thread = thread::spawn(move || {
+        let mut thread_outputs = vec![None; num_cpus];
+        let mut thread_count = 0;
+        let mut thread_count_orig = 0;
+        let mut has_end = false;
+
+        loop {
+            match stdout_channel_recv.recv().unwrap() {
+                StdoutOutput::Start {
+                    thread_count: count,
+                    has_end: end,
+                    has_begin,
+                } => {
+                    thread_count = count;
+                    thread_count_orig = count;
+                    has_end = end;
+
+                    if has_begin {
+                        print!("[1");
+                    }
+                },
+                StdoutOutput::End => { break },
+                StdoutOutput::Output {
+                    thread_index,
+                    output_string,
+                } => {
+                    thread_count -= 1;
+                    thread_outputs[thread_index] = Some(output_string);
+
+                    if thread_count == 0 {
+                        for thread_index in 0..thread_count_orig {
+                            let output_string = thread_outputs[thread_index].take().unwrap();
+
+                            if output_string.len() > 2 {
+                                print!(", ");
+                            }
+                            print!("{}", &output_string[1..output_string.len() - 1]);
+                        }
+
+                        if has_end {
+                            println!("]");
+                        }
+                    }
+                },
+            };
+        }
+    });
+
+    let mut previous_row = vec![0; rows + 1];
+    // First two numbers of previous_row are 1, the rest 0
+    previous_row[0..2].copy_from_slice(&[1, 1]);
+    let previous_row = Arc::new(RwLock::new(previous_row));
+
+    let mut previous_row_refs = (0..num_cpus)
+        .into_iter()
+        .map(|_| Some(Arc::clone(&previous_row)))
+        .collect::<Vec<_>>();
+    let mut output_channels = (0..num_cpus)
+        .into_iter()
+        .map(|_| Some(stdout_channel.clone()))
+        .collect::<Vec<_>>();
     let mut input_channels = (0..num_cpus)
         .into_iter()
         .map(|_| {
@@ -37,23 +109,26 @@ fn main() {
             (channel, Some(recv))
         })
         .collect::<Vec<_>>();
+    let (output_channel, output_channel_recv) = unbounded::<ThreadReport>();
 
     let threads = (0..num_cpus)
         .into_iter()
         .map(|index| {
-            let output_channel = output_channel.clone();
+            let previous_row = previous_row_refs[index].take().unwrap();
+            let sync_output_channel = output_channel.clone();
+            let output_channel = output_channels[index].take().unwrap();
             let input_channel = input_channels[index].1.take().unwrap();
             thread::spawn(move || {
                 let mut output = Arc::new(vec![0; THREAD_BATCH_SIZE + 1]);
-                let mut output_string = Arc::new(String::new());
+                let mut output_string = String::new();
                 while let Some(workload) = input_channel.recv().unwrap() {
                     let mut output_index = 0;
                     let start;
                     let orig_offset;
 
                     {
+                        let previous_row = previous_row.read().unwrap();
                         let Workload {
-                            previous_row,
                             offset,
                             row_index,
                         } = workload;
@@ -68,18 +143,22 @@ fn main() {
                             output_index += 1;
                         }
 
-                        let output_string_mut = Arc::get_mut(&mut output_string).unwrap();
-                        output_string_mut.clear();
-                        write!(output_string_mut, "{:?}", &output_vec[0..output_index]).unwrap();
+                        output_string.clear();
+                        write!(output_string, "{:?}", &output_vec[0..output_index]).unwrap();
                     }
 
                     output_channel
-                        .send(ThreadOutput {
+                        .send(StdoutOutput::Output {
+                            thread_index: index,
+                            output_string: output_string.clone(),
+                        })
+                        .unwrap();
+                    sync_output_channel
+                        .send(ThreadReport {
                             thread_index: index,
                             output_start: start - orig_offset,
                             output_size: output_index,
                             output_vec: Arc::clone(&output),
-                            output_string: Arc::clone(&output_string),
                         })
                         .unwrap();
                 }
@@ -87,116 +166,92 @@ fn main() {
         })
         .collect::<Vec<_>>();
 
-    let (stdout_channel, stdout_channel_recv) = unbounded();
-    let stdout_thread = thread::spawn(move || {
-        while let Some(console_output) = stdout_channel_recv.recv().unwrap() {
-            print!("{}", console_output);
-        }
-    });
-
-    let mut console_output_size = 0;
-    let mut previous_row = vec![0; rows + 1];
-    // First two numbers of previous_row are 1, the rest 0
-    previous_row[0..2].copy_from_slice(&[1, 1]);
-    let mut previous_row = Arc::new(previous_row);
-    let mut thread_output_reports: Vec<Option<ThreadOutput>> = vec![None; num_cpus];
-    let mut write_log = Vec::with_capacity(num_cpus * THREAD_BATCH_SIZE);
+    // let mut console_output_size = 0;
+    let mut thread_output_reports: Vec<Option<ThreadReport>> = vec![None; num_cpus];
+    let mut write_log = vec![0; num_cpus * THREAD_BATCH_SIZE];
     let mut write_log_row_offset = 0;
+    let mut write_log_len = 0;
 
     println!("{:?}", [1]);
     println!("{:?}", [1, 1]);
 
     for i in 3..=rows {
-        let mut console_output = String::with_capacity(console_output_size);
-        write!(&mut console_output, "[1").unwrap();
         let mut row_offset = 0;
 
         while row_offset < i {
-            let mut thread_index = 0;
+
+            let thread_count;
             let current_initial_row_offset = row_offset;
             {
+                thread_count = ((i as i64 - row_offset as i64) / (THREAD_BATCH_SIZE as i64))
+                    .max(1)
+                    .min(num_cpus as i64) as usize;
+                let has_end = row_offset + THREAD_BATCH_SIZE * num_cpus >= i;
+                stdout_channel.send(StdoutOutput::Start {
+                    thread_count,
+                    has_begin: row_offset == 0,
+                    has_end,
+                }).unwrap();
+
                 let mut workload = Workload {
-                    previous_row: Arc::clone(&previous_row),
                     offset: 0,
                     row_index: i,
                 };
 
-                for _ in 0..num_cpus {
+                for thread_index in 0..thread_count {
                     workload.offset = row_offset;
                     input_channels[thread_index].0.send(Some(workload.clone())).unwrap();
 
                     row_offset += THREAD_BATCH_SIZE;
-                    thread_index += 1;
-                    if row_offset >= i {
-                        break;
-                    }
                 }
             }
 
             // Wait for all the threads to finish
-            for _ in 0..thread_index {
+            for _ in 0..thread_count {
                 let thread_output = output_channel_recv.recv().unwrap();
                 let thread_index = thread_output.thread_index;
                 thread_output_reports[thread_index] = Some(thread_output);
             }
 
             // Write previous log
-            if write_log.len() > 0 {
-                let previous_row_mut = Arc::get_mut(&mut previous_row).unwrap();
-                (&mut previous_row_mut[write_log_row_offset..write_log_row_offset + write_log.len()])
-                    .copy_from_slice(&write_log);
-                write_log.clear();
+            if write_log_len > 0 {
+                let mut previous_row_mut = previous_row.write().unwrap();
+                (&mut previous_row_mut[write_log_row_offset..write_log_row_offset + write_log_len])
+                    .copy_from_slice(&write_log[0..write_log_len]);
+                write_log_len = 0;
             }
 
-            {
-                for index in 0..thread_index {
-                    let cur_thread_output = thread_output_reports[index].take().unwrap();
-                    let output_vec = cur_thread_output.output_vec;
+            for index in 0..thread_count {
+                let cur_thread_output = thread_output_reports[index].take().unwrap();
+                let output_vec = cur_thread_output.output_vec;
 
-                    let write_log_len = write_log.len();
-                    write_log.resize(write_log_len + cur_thread_output.output_size, 0);
-                    (&mut write_log[write_log_len..write_log_len + cur_thread_output.output_size])
-                        .copy_from_slice(&output_vec[0..cur_thread_output.output_size]);
+                let new_write_log_len = write_log_len + cur_thread_output.output_size;
+                (&mut write_log[write_log_len..new_write_log_len])
+                    .copy_from_slice(&output_vec[0..cur_thread_output.output_size]);
 
-                    write_log_row_offset = (current_initial_row_offset + cur_thread_output.output_start).max(
-                        write_log_row_offset
-                    );
-
-                    let output_string = &cur_thread_output.output_string;
-                    if output_string.len() > 2 {
-                        write!(&mut console_output, ", ").unwrap();
-                    }
-                    write!(&mut console_output, "{}", &output_string[1..output_string.len() - 1]).unwrap();
-                }
+                write_log_len = new_write_log_len;
+                write_log_row_offset = (current_initial_row_offset + cur_thread_output.output_start).max(
+                    write_log_row_offset
+                );
             }
-
-            // // Flush string if it gets too big
-            // if console_output.len() > OUTPUT_BUFFER_MAX_SIZE {
-            //     print!("{}", &console_output);
-            //     console_output.clear();
-            // }
         }
 
         // Write previous log
-        if write_log.len() > 0 {
-            let previous_row_mut = Arc::get_mut(&mut previous_row).unwrap();
-            (&mut previous_row_mut[write_log_row_offset..write_log_row_offset + write_log.len()])
-                .copy_from_slice(&write_log);
-            write_log.clear();
+        if write_log_len > 0 {
+            let mut previous_row_mut = previous_row.write().unwrap();
+            (&mut previous_row_mut[write_log_row_offset..write_log_row_offset + write_log_len])
+                .copy_from_slice(&write_log[0..write_log_len]);
+            write_log_len = 0;
         }
 
         write_log_row_offset = 0;
-        write!(&mut console_output, "]\n").unwrap();
-
-        console_output_size = console_output.len();
-        stdout_channel.send(Some(console_output)).unwrap();
     }
 
     // Shut down threads
     for index in 0..num_cpus {
         input_channels[index].0.send(None).unwrap();
     }
-    stdout_channel.send(None).unwrap();
+    stdout_channel.send(StdoutOutput::End).unwrap();
 
     for thread in threads {
         thread.join().unwrap();
